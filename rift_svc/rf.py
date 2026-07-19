@@ -14,6 +14,15 @@ from rift_svc.utils import (
 ) 
 
 
+def masked_std(y: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Per-sample std over valid (non-padded) frames only. y: [b n d], mask: [b n] -> [b 1 1]"""
+    m = mask.unsqueeze(-1)
+    denom = (m.sum(dim=(1, 2)) * y.shape[-1]).clamp(min=1)
+    mean = (y * m).sum(dim=(1, 2)) / denom
+    var = (((y - mean.view(-1, 1, 1)) ** 2) * m).sum(dim=(1, 2)) / denom
+    return var.sqrt().view(-1, 1, 1)
+
+
 def sample_time(time_schedule: Literal['uniform', 'lognorm'], size: int, device: torch.device):
     if time_schedule == 'uniform':
         t = torch.rand((size,), device=device)
@@ -71,6 +80,9 @@ class RF(nn.Module):
         skip_cfg_strength: float = 0.0,
         cfg_skip_layers: Union[int, List[int], None] = None,
         cfg_rescale: float = 0.7,
+        ode_method: str | None = None,
+        sway_coef: float = 0.0,
+        generator: torch.Generator | None = None,
     ):
         self.eval()
 
@@ -101,7 +113,7 @@ class RF(nn.Module):
                 pred = self.transformer(
                     x=x, spk=spk_id, f0=f0, rms=rms, cvec=cvec, time=t, mask=mask
                 )
-                std_pred = pred.std() if cfg_rescale > 1e-5 and cfg_flag else None
+                std_pred = masked_std(pred, mask) if cfg_rescale > 1e-5 and cfg_flag else None
             
             # Batched prediction with CFG
             else:
@@ -141,7 +153,7 @@ class RF(nn.Module):
                 )
                 
                 # Compute std before CFG if needed
-                std_pred = preds_batched[0::num_cond].std() if cfg_rescale > 1e-5 and cfg_flag else None
+                std_pred = masked_std(preds_batched[0::num_cond], mask) if cfg_rescale > 1e-5 and cfg_flag else None
                 
                 # Reshape predictions: [orig_batch, num_cond, seq_len, feat_dim]
                 preds_reshaped = preds_batched.reshape(orig_batch, num_cond, *preds_batched.shape[1:])
@@ -167,21 +179,28 @@ class RF(nn.Module):
             
             # Apply CFG rescaling
             if cfg_rescale > 1e-5 and cfg_flag:
-                std_cfg = pred.std()
+                std_cfg = masked_std(pred, mask).clamp(min=1e-8)
                 pred_rescaled = pred * (std_pred / std_cfg)
                 pred = cfg_rescale * pred_rescaled + (1 - cfg_rescale) * pred
             
             return pred
 
         # Noise input
-        y0 = torch.randn(batch, mel_seq_len, num_mel_channels, device=self.device)
+        y0 = torch.randn(
+            batch, mel_seq_len, num_mel_channels,
+            device=self.device, generator=generator,
+        )
         # mask out the padded tokens
         y0 = y0.masked_fill(~mask.unsqueeze(-1), 0)
 
         t_start = 0
         t = torch.linspace(t_start, 1, steps, device=self.device)
+        if abs(sway_coef) > 1e-5:
+            # Sway sampling (F5-TTS): negative coef concentrates steps at low t
+            t = t + sway_coef * (torch.cos(math.pi / 2 * t) - 1 + t)
 
-        trajectory = odeint(fn, y0, t, **self.odeint_kwargs)
+        odeint_kwargs = {**self.odeint_kwargs, 'method': ode_method} if ode_method else self.odeint_kwargs
+        trajectory = odeint(fn, y0, t, **odeint_kwargs)
 
         sampled = trajectory[-1]
         out = self.denorm_mel(sampled)

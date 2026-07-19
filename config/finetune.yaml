@@ -10,16 +10,25 @@ defaults:
 dataset:
   data_dir: "data/finetune"
   meta_info_path: "data/finetune/meta_info.json"
-  max_frame_len: 256
+  # Context per sample: 512 frames ~= 6s at 44.1kHz/hop512, closer to the segment
+  # lengths seen at inference. On OOM try 384 (~4.5s) or 256 (~3s, the pretrain
+  # default — also restore batch_size_per_gpu: 64), or reduce the batch size.
+  # 768 (~9s) is an option on high-VRAM GPUs.
+  max_frame_len: 512
 
 training:
   optimizer_type: adamwsf
-  learning_rate: 0.0001
+  # Matches the README finetune recipe for dit-768-12 (and the GUI default)
+  learning_rate: 0.00005
   betas: (0.9, 0.95)
   weight_decay: 0.01
-  batch_size_per_gpu: 64
+  batch_size_per_gpu: 32
   grad_accumulation_steps: 1
-  max_grad_norm: 0
+  # Compile the DiT transformer with torch.compile (inductor if triton is
+  # installed, otherwise aot_eager). First steps are slower while compiling.
+  compile_model: false
+  # Clip gradients for stability on small finetune datasets
+  max_grad_norm: 1.0
   max_steps: 10000
   warmup_ratio: 0.05
   save_per_steps: 1000
@@ -30,7 +39,16 @@ training:
   save_weights_only: true
   num_workers: 8
   eval_sample_steps: 32
+  # Single-speaker recipe (default): freeze the adaLN/time-embedding pathway and
+  # never drop the speaker — the frozen null-speaker branch from the pretrain then
+  # keeps inference-time speaker CFG working.
+  # For MULTI-speaker finetune use: training.freeze_adaln_and_tembed=false training.drop_spk_prob=0.2
+  # (the GUI training tab sets these automatically from the dataset)
+  freeze_adaln_and_tembed: true
   drop_spk_prob: 0.0
+  # Exponential moving average of the weights; checkpoints store it under
+  # 'ema_state_dict' and inference prefers it automatically. Set 0 to disable.
+  ema_decay: 0.999
   time_schedule: "lognorm"
   # Logger options
   logger: "wandb"  # Options: "wandb" or "tensorboard"

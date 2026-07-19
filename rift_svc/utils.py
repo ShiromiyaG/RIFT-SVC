@@ -322,10 +322,21 @@ class CustomProgressBar(TQDMProgressBar):
         self.start_time = time.time()
         self.total_steps = trainer.max_steps
 
+    def on_train_epoch_start(self, trainer, pl_module):
+        super().on_train_epoch_start(trainer, pl_module)
+        # Track optimizer steps, not batches: with gradient accumulation the
+        # batch-based total is misleading (Lightning estimates it without accum)
+        self.train_progress_bar.reset(total=self.total_steps)
+        self.train_progress_bar.initial = trainer.global_step
+        self.train_progress_bar.n = trainer.global_step
+        self.train_progress_bar.set_description("Training (steps)")
+
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        super().on_train_batch_end(trainer, pl_module, outputs, batch, batch_idx)
-        
+        # Intentionally not calling super(): the parent advances the bar by batch
+        # count, which fights the optimizer-step tracking below (and renders the
+        # total as '?' whenever the batch count exceeds max_steps)
         current_step = trainer.global_step
+        self.train_progress_bar.n = current_step
         total_steps = self.total_steps
 
         # Calculate elapsed time since training started

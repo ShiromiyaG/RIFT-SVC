@@ -70,7 +70,7 @@ def process_audio_file(file_path, target_sample_rate, target_loudness, headroom=
 
 def gather_audio_files(source_root):
     """
-    Gathers all .wav audio files from the source directory.
+    Gathers all .wav and .flac audio files from the source directory.
 
     Parameters:
     - source_root (Path): Root directory of the source.
@@ -83,7 +83,7 @@ def gather_audio_files(source_root):
         current_path = Path(dirpath)
 
         for file in filenames:
-            if file.lower().endswith('.wav'):
+            if file.lower().endswith('.wav') or file.lower().endswith('.flac'):
                 file_path = current_path / file
                 audio_files.append(file_path)
     return audio_files

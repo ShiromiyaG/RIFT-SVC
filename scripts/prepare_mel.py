@@ -4,12 +4,11 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from pathlib import Path
 import torch
-import torchaudio
 import click
 from functools import partial
 
 from rift_svc.feature_extractors import get_mel_spectrogram
-from multiprocessing_utils import run_parallel, get_device
+from multiprocessing_utils import run_parallel, get_device, load_audio
 
 def process_audio(audio, data_dir, hop_length, n_mel_channels, sample_rate, verbose, overwrite, device):
     """
@@ -38,7 +37,7 @@ def process_audio(audio, data_dir, hop_length, n_mel_channels, sample_rate, verb
         return
 
     try:
-        waveform, sr = torchaudio.load(str(wav_path))
+        waveform, sr = load_audio(wav_path)
         # Ensure the correct shape
         if len(waveform.shape) == 1:
             waveform = waveform.unsqueeze(0)

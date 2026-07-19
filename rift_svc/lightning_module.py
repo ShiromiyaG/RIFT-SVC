@@ -3,7 +3,7 @@ import os
 import numpy as np
 import torch
 import torch.nn.functional as F
-import torchaudio
+import soundfile as sf
 import wandb
 from functools import partial
 import inspect
@@ -36,6 +36,9 @@ class RIFTSVCLightningModule(LightningModule):
         )
         self.log_media_per_steps = cfg['training']['log_media_per_steps']
         self.drop_spk_prob = cfg['training']['drop_spk_prob']
+        self.ema_decay = cfg['training'].get('ema_decay', 0.0)
+        self.ema_shadow = None
+        self._ema_backup = None
 
         self.vocoder = None
         self.save_hyperparameters(ignore=['model', 'optimizer', 'vocoder'])
@@ -50,6 +53,65 @@ class RIFTSVCLightningModule(LightningModule):
                 "interval": "step",
             }
         }
+
+    # --- EMA helpers ---
+
+    @property
+    def ema_enabled(self):
+        return self.ema_decay > 0
+
+    def on_train_start(self):
+        if self.ema_enabled:
+            if self.ema_shadow is None:
+                self.ema_shadow = {
+                    name: p.detach().clone()
+                    for name, p in self.model.named_parameters() if p.requires_grad
+                }
+            else:
+                # Restored from checkpoint: move to the current device
+                self.ema_shadow = {k: v.to(self.device) for k, v in self.ema_shadow.items()}
+
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        if not self.ema_enabled or self.ema_shadow is None:
+            return
+        # Warmup the decay so early finetune steps aren't dominated by the init weights
+        step = self.global_step
+        decay = min(self.ema_decay, (1 + step) / (10 + step))
+        with torch.no_grad():
+            for name, p in self.model.named_parameters():
+                if name in self.ema_shadow:
+                    self.ema_shadow[name].mul_(decay).add_(p.detach(), alpha=1 - decay)
+
+    def _ema_swap_in(self):
+        """Temporarily load EMA weights into the model (for validation/test)."""
+        if not self.ema_enabled or self.ema_shadow is None or self._ema_backup is not None:
+            return
+        self._ema_backup = {
+            name: p.detach().clone()
+            for name, p in self.model.named_parameters() if name in self.ema_shadow
+        }
+        with torch.no_grad():
+            for name, p in self.model.named_parameters():
+                if name in self.ema_shadow:
+                    p.copy_(self.ema_shadow[name])
+
+    def _ema_swap_out(self):
+        """Restore the raw training weights after validation/test."""
+        if self._ema_backup is None:
+            return
+        with torch.no_grad():
+            for name, p in self.model.named_parameters():
+                if name in self._ema_backup:
+                    p.copy_(self._ema_backup[name])
+        self._ema_backup = None
+
+    def on_save_checkpoint(self, checkpoint):
+        if self.ema_shadow is not None:
+            checkpoint['ema_state_dict'] = {k: v.detach().cpu() for k, v in self.ema_shadow.items()}
+
+    def on_load_checkpoint(self, checkpoint):
+        if 'ema_state_dict' in checkpoint:
+            self.ema_shadow = {k: v.clone() for k, v in checkpoint['ema_state_dict'].items()}
 
     def training_step(self, batch, batch_idx):
         mel = batch['mel']
@@ -86,6 +148,7 @@ class RIFTSVCLightningModule(LightningModule):
     def on_validation_start(self):
         if hasattr(self.optimizer, 'eval'):
             self.optimizer.eval()
+        self._ema_swap_in()
         if not self.trainer.is_global_zero:
             return
 
@@ -101,9 +164,27 @@ class RIFTSVCLightningModule(LightningModule):
         self.mse = []
 
 
+    def on_validation_epoch_end(self):
+        # Restore raw weights before ModelCheckpoint runs at on_validation_end
+        self._ema_swap_out()
+
+        if not self.trainer.is_global_zero or len(self.mcd) == 0:
+            return
+
+        # Log through self.log so ModelCheckpoint can monitor these metrics
+        metrics = {
+            'val/mcd': float(np.mean(self.mcd)),
+            'val/si_snr': float(np.mean(self.si_snr)),
+            'val/psnr': float(np.mean(self.psnr)),
+            'val/mse': float(np.mean(self.mse))
+        }
+        for metric_name, metric_value in metrics.items():
+            self.log(metric_name, metric_value, rank_zero_only=True)
+
     def on_validation_end(self, log=True):
         if hasattr(self.optimizer, 'eval'):
             self.optimizer.train()
+        self._ema_swap_out()
         if not self.trainer.is_global_zero:
             return
 
@@ -111,18 +192,6 @@ class RIFTSVCLightningModule(LightningModule):
             self.vocoder = self.vocoder.cpu()
             gc.collect()
             torch.cuda.empty_cache()
-        
-        metrics = {
-            'val/mcd': np.mean(self.mcd),
-            'val/si_snr': np.mean(self.si_snr),
-            'val/psnr': np.mean(self.psnr),
-            'val/mse': np.mean(self.mse)
-        }
-
-        if log:
-            # Log metrics - compatible with both loggers
-            for metric_name, metric_value in metrics.items():
-                self._log_scalar(metric_name, metric_value)
 
 
     def validation_step(self, batch, batch_idx, log=True):
@@ -196,13 +265,13 @@ class RIFTSVCLightningModule(LightningModule):
                 # Log generated audio at specified intervals
                 if global_step % log_media_every_n_steps == 0:
                     audio_path = f".cache/spk-{spk_id[i].item()}_{sample_idx}_gen.wav"
-                    torchaudio.save(audio_path, wav_gen.cpu().to(torch.float32), 44100)
+                    sf.write(audio_path, wav_gen.cpu().to(torch.float32).T.numpy(), 44100)
                     self._log_audio(self.logger, f"val-audio/spk-{spk_id[i].item()}_{sample_idx}-gen", audio_path, global_step)
                 
                 # Log ground truth audio only at the first step
                 if global_step == 0:
                     gt_audio_path = f".cache/spk-{spk_id[i].item()}_{sample_idx}_gt.wav"
-                    torchaudio.save(gt_audio_path, wav_gt.cpu().to(torch.float32), 44100)
+                    sf.write(gt_audio_path, wav_gt.cpu().to(torch.float32).T.numpy(), 44100)
                     self._log_audio(self.logger, f"val-audio/spk-{spk_id[i].item()}_{sample_idx}-gt", gt_audio_path, global_step)
 
                 # Log mel spectrograms at specified intervals

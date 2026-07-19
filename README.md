@@ -136,12 +136,12 @@ training.logger=wandb or tensorboard
 
 If you want to train multiple speakers, you may try unfreeze the adaLN and time embedding:
 ```bash
-+training.freeze_adaln_and_tembed=false
+training.freeze_adaln_and_tembed=false
 training.drop_spk_prob=0.2
 ```
 
 ##### VRAM Consumption
-The below table shows the VRAM consumption of different models, all tested on one 3090 GPU, with `+training.freeze_adaln_and_tembed=true`.
+The below table shows the VRAM consumption of different models, all tested on one 3090 GPU, with `training.freeze_adaln_and_tembed=true`.
 
 | Model | Batch Size | VRAM Consumption |
 | --- | --- | --- |

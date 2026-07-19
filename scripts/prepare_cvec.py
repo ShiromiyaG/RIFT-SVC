@@ -9,7 +9,7 @@ import torch
 import torchaudio
 from functools import partial
 
-from multiprocessing_utils import run_parallel, get_device
+from multiprocessing_utils import run_parallel, get_device, load_audio
 from rift_svc.feature_extractors import HubertModelWithFinalProj
 
 
@@ -61,7 +61,7 @@ def process_cvec(audio, data_dir, model_path, overwrite, verbose):
         return
     
     try:
-        waveform, sr = torchaudio.load(str(wav_path))
+        waveform, sr = load_audio(wav_path)
         model, device = get_cvec_model(model_path)
         waveform = waveform.to(device)
 

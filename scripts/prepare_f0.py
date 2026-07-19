@@ -9,7 +9,7 @@ import torchaudio
 from functools import partial
 import multiprocessing
 
-from multiprocessing_utils import run_parallel, get_device
+from multiprocessing_utils import run_parallel, get_device, load_audio
 from rift_svc.rmvpe.inference import RMVPE
 
 RMVPE_HOP_LENGTH = 160
@@ -47,7 +47,7 @@ def process_f0(audio, data_dir, model_path, hop_length, sample_rate, overwrite, 
             click.echo(f"Warning: WAV file not found: {wav_path}")
         return
     try:
-        waveform, sr = torchaudio.load(str(wav_path))
+        waveform, sr = load_audio(wav_path)
         model, device = get_f0_model(model_path)
         waveform = waveform.to(device)
 

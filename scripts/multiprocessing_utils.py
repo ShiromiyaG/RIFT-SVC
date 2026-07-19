@@ -10,10 +10,23 @@ from pathlib import Path
 from multiprocessing import Pool, cpu_count
 from tqdm import tqdm
 import torch
+import soundfile as sf
 
 def get_device():
     """返回单个device: 如果有CUDA则使用cuda:0，否则CPU。"""
     return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+def load_audio(wav_path):
+    """
+    用soundfile读取音频，返回与torchaudio.load一致的(waveform, sample_rate)。
+
+    waveform为float32张量，形状为(channels, frames)。相比torchaudio.load，
+    此实现不依赖torchcodec/FFmpeg共享库，避免在Windows上的加载问题。
+    """
+    data, sr = sf.read(str(wav_path), dtype="float32", always_2d=True)
+    # soundfile返回(frames, channels)，转置为(channels, frames)
+    waveform = torch.from_numpy(data.T).contiguous()
+    return waveform, sr
 
 def run_parallel(audio_list, process_func, num_workers, desc="Processing", initializer=None, initargs=()):
     """

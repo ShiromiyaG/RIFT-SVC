@@ -114,7 +114,7 @@ training.batch_size_per_gpu=64 \
 training.save_per_steps=1000 \
 training.test_per_steps=1000 \
 training.time_schedule=lognorm \
-+training.freeze_adaln_and_tembed=true \
+training.freeze_adaln_and_tembed=true \
 training.drop_spk_prob=0.0 \
 training.logger=wandb or tensorboard
 ```
@@ -136,12 +136,12 @@ training.logger=wandb or tensorboard
 
 如果您想训练多个说话者，可以尝试上述的参数，也可以尝试解冻adaLN和时间嵌入：
 ```bash
-+training.freeze_adaln_and_tembed=false
+training.freeze_adaln_and_tembed=false
 training.drop_spk_prob=0.2
 ```
 
 ##### VRAM消耗
-下表显示了不同模型的VRAM消耗，所有测试均在一个3090 GPU上进行，使用`+training.freeze_adaln_and_tembed=true`。
+下表显示了不同模型的VRAM消耗，所有测试均在一个3090 GPU上进行，使用`training.freeze_adaln_and_tembed=true`。
 
 | 模型 | 批量大小 | VRAM消耗 |
 | --- | --- | --- |

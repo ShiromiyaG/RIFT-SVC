@@ -4,6 +4,7 @@ import numpy as np
 import pyloudnorm as pyln
 import torch
 import torchaudio
+import soundfile as sf
 from pathlib import Path
 from tqdm import tqdm
 from torch.amp import autocast
@@ -26,6 +27,11 @@ def extract_state_dict(ckpt):
         if k.startswith('model.'):
             new_k = k.replace('model.', '')
             new_state_dict[new_k] = v
+    if 'ema_state_dict' in ckpt:
+        # Prefer EMA weights when available (keys already match the stripped names)
+        click.echo("Using EMA weights from checkpoint")
+        for k, v in ckpt['ema_state_dict'].items():
+            new_state_dict[k] = v
     spk2idx = ckpt['hyper_parameters']['cfg']['spk2idx']
     model_cfg = ckpt['hyper_parameters']['cfg']['model']
     dataset_cfg = ckpt['hyper_parameters']['cfg']['dataset']
@@ -43,10 +49,9 @@ def load_models(model_path, device, use_fp16=True):
     svc_model = RF(transformer=transformer)
     svc_model.load_state_dict(state_dict)
     svc_model = svc_model.to(device)
-    
-    if use_fp16 and device != 'cpu':
-        svc_model = svc_model.half()
-    
+
+    # Keep the flow model weights in fp32: the ODE integration accumulates numerical
+    # error across steps, so only the matmuls run in fp16 (via autocast).
     svc_model.eval()
     
     vocoder = NsfHifiGAN('pretrained/nsf_hifigan_44.1k_hop512_128bin_2024.02/model.ckpt').to(device)
@@ -65,7 +70,9 @@ def load_models(model_path, device, use_fp16=True):
 def load_audio(file_path, target_sr):
     """Load and preprocess audio file"""
     click.echo("Loading audio...")
-    audio, sr = torchaudio.load(file_path)
+    data, sr = sf.read(str(file_path), dtype="float32", always_2d=True)
+    # soundfile返回(frames, channels)，转置为(channels, frames)
+    audio = torch.from_numpy(data.T).contiguous()
     if sr != target_sr:
         audio = torchaudio.functional.resample(audio, sr, target_sr)
 
@@ -162,14 +169,15 @@ def extract_features(audio_segment, sample_rate, hop_length, rmvpe, hubert, rms_
 
 
 def run_inference(
-    model, mel, cvec, f0, rms, cvec_ds, spk_id, 
-    infer_steps, ds_cfg_strength, spk_cfg_strength, 
+    model, mel, cvec, f0, rms, cvec_ds, spk_id,
+    infer_steps, ds_cfg_strength, spk_cfg_strength,
     skip_cfg_strength, cfg_skip_layers, cfg_rescale,
-    frame_lengths=None, use_fp16=True
+    frame_lengths=None, use_fp16=True,
+    ode_method=None, sway_coef=0.0, generator=None
 ):
     """Run the actual inference through the model with optional batch processing"""
     device_type = 'cuda' if mel.device.type == 'cuda' else 'cpu'
-    
+
     with autocast(device_type=device_type, enabled=use_fp16):
         mel_out, _ = model.sample(
             src_mel=mel,
@@ -185,8 +193,11 @@ def run_inference(
             cfg_skip_layers=cfg_skip_layers,
             cfg_rescale=cfg_rescale,
             frame_len=frame_lengths,
+            ode_method=ode_method,
+            sway_coef=sway_coef,
+            generator=generator,
         )
-    
+
     return mel_out
 
 
@@ -230,7 +241,10 @@ def process_segment(
     target_loudness=-18.0,
     restore_loudness=True,
     robust_f0=0,
-    use_fp16=True
+    use_fp16=True,
+    ode_method=None,
+    sway_coef=0.0,
+    generator=None
 ):
     """Process a single audio segment and return the converted audio"""
     mel, cvec, cvec_ds, f0, rms, original_loudness = extract_features(
@@ -258,9 +272,12 @@ def process_segment(
         cfg_skip_layers=cfg_skip_layers,
         cfg_rescale=cfg_rescale,
         frame_lengths=frame_length,
-        use_fp16=use_fp16
+        use_fp16=use_fp16,
+        ode_method=ode_method,
+        sway_coef=sway_coef,
+        generator=generator
     )
-    
+
     audio_out = generate_audio(
         vocoder, mel_out, f0, 
         original_loudness if restore_loudness else None, 
@@ -289,7 +306,10 @@ def batch_process_segments(
     use_fp16=True,
     batch_size=1,
     gr_progress=None,
-    progress_desc=None
+    progress_desc=None,
+    ode_method=None,
+    sway_coef=0.0,
+    generator=None
 ):
     """Process audio segments in batches for faster inference"""
     if batch_size <= 1:
@@ -303,7 +323,8 @@ def batch_process_segments(
                 key_shift, infer_steps, ds_cfg_strength, spk_cfg_strength,
                 skip_cfg_strength, cfg_skip_layers, cfg_rescale,
                 cvec_downsample_rate, target_loudness, restore_loudness,
-                robust_f0, use_fp16
+                robust_f0, use_fp16,
+                ode_method, sway_coef, generator
             )
             results.append((start_sample, audio_out, len(chunk)))
         return results
@@ -403,9 +424,12 @@ def batch_process_segments(
                 cfg_skip_layers=cfg_skip_layers,
                 cfg_rescale=cfg_rescale,
                 frame_lengths=frame_lengths,
-                use_fp16=use_fp16
+                use_fp16=use_fp16,
+                ode_method=ode_method,
+                sway_coef=sway_coef,
+                generator=generator
             )
-            
+
             with autocast(device_type='cuda' if device.type == 'cuda' else 'cpu', enabled=use_fp16):
                 audio_out = vocoder(mel_out.transpose(1, 2), batched_f0)
             
@@ -479,8 +503,11 @@ def pad_tensor_to_length(tensor, length):
 @click.option('--slicer-min-interval', type=int, default=100, help='Minimum interval between audio segments in milliseconds')
 @click.option('--slicer-hop-size', type=int, default=10, help='Hop size for audio slicing in milliseconds')
 @click.option('--slicer-max-sil-kept', type=int, default=200, help='Maximum silence kept in milliseconds')
-@click.option('--use-fp16', is_flag=True, default=True, help='Use float16 precision for faster inference')
+@click.option('--use-fp16/--no-fp16', default=True, help='Use float16 autocast for faster inference')
 @click.option('--batch-size', type=int, default=1, help='Batch size for parallel inference')
+@click.option('--ode-method', type=click.Choice(['euler', 'midpoint', 'rk4']), default='euler', help='ODE solver (midpoint gives better quality per step than euler)')
+@click.option('--sway-coef', type=float, default=0.0, help='Sway sampling coefficient (e.g. -0.5 concentrates steps at low t; 0 disables)')
+@click.option('--seed', type=int, default=42, help='Random seed for the initial noise (consistent timbre across segments/runs)')
 def main(
     model,
     input,
@@ -505,13 +532,19 @@ def main(
     slicer_hop_size,
     slicer_max_sil_kept,
     use_fp16,
-    batch_size
+    batch_size,
+    ode_method,
+    sway_coef,
+    seed
 ):
     """Convert the voice in an audio file to a target speaker."""
 
     if device is None:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
     device = torch.device(device)
+
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed)
 
     svc_model, vocoder, rmvpe, hubert, rms_extractor, spk2idx, dataset_cfg = load_models(model, device, use_fp16)
 
@@ -551,7 +584,8 @@ def main(
             key_shift, infer_steps, ds_cfg_strength, spk_cfg_strength,
             skip_cfg_strength, cfg_skip_layers, cfg_rescale,
             cvec_downsample_rate, target_loudness, restore_loudness,
-            robust_f0, use_fp16, batch_size
+            robust_f0, use_fp16, batch_size,
+            ode_method=ode_method, sway_coef=sway_coef, generator=generator
         )
 
     result_audio = np.zeros(len(audio) + fade_samples)
@@ -577,7 +611,7 @@ def main(
     click.echo("Saving output...")
     output_path = Path(output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    torchaudio.save(output, torch.from_numpy(result_audio).unsqueeze(0), sample_rate)
+    sf.write(str(output), result_audio, sample_rate)
     click.echo("Done!")
 
 

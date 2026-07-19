@@ -3,11 +3,10 @@ import sys, os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from pathlib import Path
 import torch
-import torchaudio
 import click
 from functools import partial
 
-from multiprocessing_utils import run_parallel, get_device
+from multiprocessing_utils import run_parallel, get_device, load_audio
 from rift_svc.feature_extractors import RMSExtractor
 
 
@@ -50,7 +49,7 @@ def process_rms(audio, data_dir, hop_length, verbose):
         return
 
     try:
-        waveform, sr = torchaudio.load(str(wav_path))
+        waveform, sr = load_audio(wav_path)
         extractor, device = get_rms_extractor(hop_length)
         waveform = waveform.to(device)
 
