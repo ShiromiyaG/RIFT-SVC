@@ -5,10 +5,10 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 from pytorch_lightning.loggers import WandbLogger, TensorBoardLogger
-from torch.utils.data import DataLoader, RandomSampler
+from torch.utils.data import DataLoader
 
 from rift_svc import DiT, RF
-from rift_svc.dataset import SVCDataset, collate_fn
+from rift_svc.dataset import SVCDataset, collate_fn, LengthBucketedRandomBatchSampler
 from rift_svc.lightning_module import RIFTSVCLightningModule
 from rift_svc.utils import CustomProgressBar, load_state_dict
 from rift_svc.optim import get_optimizer
@@ -23,6 +23,87 @@ warnings.filterwarnings('ignore', message='.*control TF32 behavior.*')
 # falls back to 32-bit numbers; training itself is unaffected
 warnings.filterwarnings('ignore', message='.*not supported by the model summary.*')
 torch.set_float32_matmul_precision('high')
+
+
+class SlimInferenceCheckpoint(pl.Callback):
+    """Saves small inference-only checkpoints: a single fp16 copy of the weights
+    (EMA already merged in) plus the config — no optimizer state, no separate
+    raw/EMA copies. Loadable by infer.py and the GUI like any checkpoint, but
+    NOT resumable; resume from the full 'last.ckpt' kept alongside.
+    """
+
+    def __init__(self, dirpath, every_n_train_steps):
+        self.dirpath = dirpath
+        self.every_n_train_steps = every_n_train_steps
+        self.best_mcd = float('inf')
+        self._last_saved_step = -1
+
+    def _save(self, pl_module, filename):
+        weights = {k: v.detach().cpu() for k, v in pl_module.model.state_dict().items()}
+        if pl_module.ema_shadow is not None:
+            # Inference prefers EMA weights; merge them in so only one copy is stored
+            for k, v in pl_module.ema_shadow.items():
+                weights[k] = v.detach().cpu()
+        state_dict = {
+            'model.' + k: (v.half() if v.is_floating_point() else v)
+            for k, v in weights.items()
+        }
+        ckpt = {'state_dict': state_dict, 'hyper_parameters': {'cfg': pl_module.cfg}}
+        os.makedirs(self.dirpath, exist_ok=True)
+        torch.save(ckpt, os.path.join(self.dirpath, filename))
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        step = trainer.global_step
+        if (step > 0 and step % self.every_n_train_steps == 0
+                and step != self._last_saved_step and trainer.is_global_zero):
+            self._last_saved_step = step
+            self._save(pl_module, f'model-step={step}.ckpt')
+
+    def on_validation_end(self, trainer, pl_module):
+        if trainer.sanity_checking or not trainer.is_global_zero:
+            return
+        mcd = trainer.callback_metrics.get('val/mcd')
+        if mcd is not None and float(mcd) < self.best_mcd:
+            self.best_mcd = float(mcd)
+            self._save(pl_module, 'model-best.ckpt')
+
+
+def load_pretrained_weights(rf, pretrained_path, init_spk_embed=True):
+    """Load pretrain weights into the RF model, allowing mismatched speaker tables.
+
+    When the checkpoint has no usable speaker table (the distributed pretrains ship
+    without one, and a user pretrain's table has a different row count), the new
+    speaker embedding(s) optionally start from the pretrain's "average voice" —
+    the mean of its speaker table if present, else the null-speaker (CFG
+    unconditional) embedding — instead of random init, which speeds up timbre
+    convergence on finetune.
+    """
+    state_dict = torch.load(pretrained_path, map_location='cpu')
+    if 'state_dict' in state_dict:
+        state_dict = state_dict['state_dict']
+    if any(k.startswith('model.') for k in state_dict.keys()):
+        state_dict = {k.replace('model.', ''): v for k, v in state_dict.items()}
+
+    spk_key = 'transformer.spk_embed.weight'
+    pretrain_spk_embed = state_dict.get(spk_key)
+    if pretrain_spk_embed is not None and pretrain_spk_embed.shape != rf.transformer.spk_embed.weight.shape:
+        # Different speaker count: keep the table aside for the mean init below
+        del state_dict[spk_key]
+
+    missing_keys, unexpected_keys = load_state_dict(rf, state_dict)
+
+    if init_spk_embed and spk_key in missing_keys:
+        if pretrain_spk_embed is not None:
+            init = pretrain_spk_embed.mean(dim=0, keepdim=True)
+        else:
+            init = state_dict.get('transformer.null_spk_embed.weight')
+        if init is not None:
+            with torch.no_grad():
+                rf.transformer.spk_embed.weight.copy_(
+                    init.to(rf.transformer.spk_embed.weight.dtype).expand_as(rf.transformer.spk_embed.weight))
+            print("Initialized speaker embedding(s) from the pretrain average voice")
+
+    return missing_keys, unexpected_keys
 
 
 @hydra.main(version_base=None, config_path="config", config_name="config")
@@ -51,11 +132,10 @@ def main(cfg: DictConfig):
 
     # Load pretrained weights if specified
     if cfg.training.get('pretrained_path', None) is not None:
-        state_dict = torch.load(cfg.training.pretrained_path, map_location='cpu')
-        if 'state_dict' in state_dict:
-            state_dict = state_dict['state_dict']
-        # Load only model weights, allowing mismatched keys for speaker embeddings
-        missing_keys, unexpected_keys = load_state_dict(rf, state_dict)
+        missing_keys, unexpected_keys = load_pretrained_weights(
+            rf, cfg.training.pretrained_path,
+            init_spk_embed=cfg.training.get('init_spk_embed_from_pretrain', True),
+        )
         print(f"Loaded pretrained model from {cfg.training.pretrained_path}")
         if missing_keys:
             print(f"Missing keys: {missing_keys}")
@@ -67,6 +147,10 @@ def main(cfg: DictConfig):
     
     if cfg.training.get('freeze_adaln_and_tembed', False):
         rf.transformer.freeze_adaln_and_tembed()
+
+    if cfg.training.get('gradient_checkpointing', False):
+        rf.transformer.gradient_checkpointing = True
+        print("Gradient checkpointing enabled for the transformer blocks")
 
     if cfg.training.get('compile_model', False):
         # Compile only the DiT transformer, in place: Module.compile keeps parameter
@@ -105,32 +189,50 @@ def main(cfg: DictConfig):
         cfg=cfg_dict
     )
 
-    checkpoint_callback = ModelCheckpoint(
-        dirpath=os.path.join('ckpts', cfg.training.run_name),
-        filename='model-{step}',
-        save_top_k=-1,
-        save_last='link',
-        every_n_train_steps=cfg.training.save_per_steps,
-        save_weights_only=cfg.training.save_weights_only,
-    )
+    run_name = cfg.training.run_name
+    ckpt_dir = os.path.join('ckpts', run_name)
 
-    # Keep the checkpoint with the best validation MCD (updated at each validation)
-    best_checkpoint_callback = ModelCheckpoint(
-        dirpath=os.path.join('ckpts', cfg.training.run_name),
-        filename='model-best',
-        monitor='val/mcd',
-        mode='min',
-        save_top_k=1,
-        auto_insert_metric_name=False,
-        save_weights_only=cfg.training.save_weights_only,
-    )
+    if cfg.training.get('slim_checkpoints', False):
+        # Disk-friendly mode: one full checkpoint ('last.ckpt', with optimizer
+        # state, overwritten in place) to resume training from, plus small fp16
+        # inference-only checkpoints (model-step=N / model-best) at each interval
+        resume_checkpoint_callback = ModelCheckpoint(
+            dirpath=ckpt_dir,
+            filename='last',
+            save_top_k=1,
+            every_n_train_steps=cfg.training.save_per_steps,
+            save_weights_only=False,
+            enable_version_counter=False,
+        )
+        checkpoint_callbacks = [
+            resume_checkpoint_callback,
+            SlimInferenceCheckpoint(ckpt_dir, cfg.training.save_per_steps),
+        ]
+    else:
+        checkpoint_callback = ModelCheckpoint(
+            dirpath=ckpt_dir,
+            filename='model-{step}',
+            save_top_k=-1,
+            save_last='link',
+            every_n_train_steps=cfg.training.save_per_steps,
+            save_weights_only=cfg.training.save_weights_only,
+        )
+
+        # Keep the checkpoint with the best validation MCD (updated at each validation)
+        best_checkpoint_callback = ModelCheckpoint(
+            dirpath=ckpt_dir,
+            filename='model-best',
+            monitor='val/mcd',
+            mode='min',
+            save_top_k=1,
+            auto_insert_metric_name=False,
+            save_weights_only=cfg.training.save_weights_only,
+        )
+        checkpoint_callbacks = [checkpoint_callback, best_checkpoint_callback]
 
     # Logger selection based on config
     logger_type = cfg.training.get('logger', 'wandb').lower()
-    run_name = cfg.training.run_name
-    # Update checkpoint directory to use run_name
-    checkpoint_callback.dirpath = os.path.join('ckpts', run_name)
-    
+
     if logger_type == 'wandb':
         # Use Weights & Biases logger
         logger = WandbLogger(
@@ -156,7 +258,7 @@ def main(cfg: DictConfig):
     else:
         raise ValueError(f"Invalid logger type: {logger_type}")
 
-    callbacks = [checkpoint_callback, best_checkpoint_callback, CustomProgressBar()]
+    callbacks = checkpoint_callbacks + [CustomProgressBar()]
     if lr_scheduler is not None:
         callbacks.append(LearningRateMonitor(logging_interval='step'))
 
@@ -183,31 +285,33 @@ def main(cfg: DictConfig):
     if hasattr(optimizer, 'train'):
         optimizer.train()
 
-    # Sample with replacement sized for the whole run so training is one single
-    # "epoch": Lightning otherwise flushes gradient accumulation at every epoch
-    # boundary, which on small finetune datasets (few batches per epoch) makes
+    # Sample with replacement sized (in batches) for the whole run so training is
+    # one single "epoch": Lightning otherwise flushes gradient accumulation at every
+    # epoch boundary, which on small finetune datasets (few batches per epoch) makes
     # accumulation nearly a no-op. Also avoids per-epoch dataloader worker restarts.
-    train_sampler = RandomSampler(
+    # Batches are bucketed by frame length to minimize padding waste.
+    train_batch_sampler = LengthBucketedRandomBatchSampler(
         train_dataset,
-        replacement=True,
-        num_samples=cfg.training.max_steps * cfg.training.batch_size_per_gpu * accum,
+        batch_size=cfg.training.batch_size_per_gpu,
+        num_batches=cfg.training.max_steps * accum,
     )
 
     trainer.fit(
         model,
         train_dataloaders=DataLoader(
             train_dataset,
-            batch_size=cfg.training.batch_size_per_gpu,
+            batch_sampler=train_batch_sampler,
             num_workers=cfg.training.num_workers,
             persistent_workers=cfg.training.num_workers > 0,
-            sampler=train_sampler,
-            drop_last=True,
+            pin_memory=True,
             collate_fn=collate_fn,
         ),
         val_dataloaders=DataLoader(
             val_dataset,
             batch_size=cfg.training.batch_size_per_gpu,
             num_workers=cfg.training.num_workers,
+            persistent_workers=cfg.training.num_workers > 0,
+            pin_memory=True,
             collate_fn=collate_fn,
         ),
         ckpt_path=cfg.training.get('resume_from_checkpoint', None),

@@ -93,6 +93,8 @@ class RF(nn.Module):
             frame_len = torch.full((batch,), mel_seq_len, device=device)
 
         mask = lens_to_mask(frame_len)
+        # Same trick as in forward: no padding -> no attention mask needed
+        attn_mask = None if bool(mask.all()) else mask
 
         # Define the ODE function
         def fn(t, x):
@@ -111,7 +113,7 @@ class RF(nn.Module):
             # Standard prediction without batching
             if not need_batched:
                 pred = self.transformer(
-                    x=x, spk=spk_id, f0=f0, rms=rms, cvec=cvec, time=t, mask=mask
+                    x=x, spk=spk_id, f0=f0, rms=rms, cvec=cvec, time=t, mask=attn_mask
                 )
                 std_pred = masked_std(pred, mask) if cfg_rescale > 1e-5 and cfg_flag else None
             
@@ -125,7 +127,7 @@ class RF(nn.Module):
                 f0_batched = f0.repeat_interleave(num_cond, dim=0)
                 rms_batched = rms.repeat_interleave(num_cond, dim=0)
                 t_batched = t.repeat_interleave(num_cond, dim=0) if isinstance(t, torch.Tensor) and t.ndim > 0 else t
-                mask_batched = mask.repeat_interleave(num_cond, dim=0) if exists(mask) else None
+                mask_batched = attn_mask.repeat_interleave(num_cond, dim=0) if exists(attn_mask) else None
                 
                 # Prepare cvec with appropriate interleaving pattern
                 if use_ds_cfg and use_spk_cfg:
@@ -172,8 +174,8 @@ class RF(nn.Module):
             # Apply skip-layer CFG
             if use_skip_cfg:
                 skip_pred = self.transformer(
-                    x=x, spk=spk_id, f0=f0, rms=rms, cvec=cvec, time=t, 
-                    mask=mask, skip_layers=cfg_skip_layers
+                    x=x, spk=spk_id, f0=f0, rms=rms, cvec=cvec, time=t,
+                    mask=attn_mask, skip_layers=cfg_skip_layers
                 )
                 pred = pred + (pred - skip_pred) * skip_cfg_strength
             
@@ -225,6 +227,10 @@ class RF(nn.Module):
             frame_len = torch.full((batch,), seq_len, device=device)
 
         mask = lens_to_mask(frame_len, length=seq_len)  # Typically padded to max length in batch
+        # When no sample is padded, drop the attention mask entirely so SDPA can
+        # take its fastest path. Decided here, outside the (possibly compiled)
+        # transformer, to avoid a data-dependent graph break.
+        attn_mask = None if bool(mask.all()) else mask
 
         x1 = self.norm_mel(mel)
         x0 = torch.randn_like(x1)
@@ -237,14 +243,14 @@ class RF(nn.Module):
         flow = x1 - x0
 
         pred = self.transformer(
-            x=xt, 
-            spk=spk_id, 
-            f0=f0, 
-            rms=rms, 
-            cvec=cvec, 
-            time=time, 
+            x=xt,
+            spk=spk_id,
+            f0=f0,
+            rms=rms,
+            cvec=cvec,
+            time=time,
             drop_speaker=drop_speaker,
-            mask=mask
+            mask=attn_mask
         )
 
         # Flow matching loss

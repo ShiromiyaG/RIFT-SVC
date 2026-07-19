@@ -20,6 +20,9 @@ training:
   batch_size_per_gpu: 64
   grad_accumulation_steps: 1
   max_grad_norm: 0
+  # Recompute transformer activations in backward: large VRAM cut at ~20-30%
+  # slower steps. Enable only if hitting OOM (prefer it over reducing batch size)
+  gradient_checkpointing: false
   max_steps: 100000
   warmup_ratio: 0.05
   save_per_steps: 10000
@@ -28,9 +31,16 @@ training:
   wandb_project: "RIFT-SVC"
   run_name: "pretrain_dit-512-8_steps${training.max_steps}-lr${training.learning_rate}" 
   save_weights_only: true
+  # Disk-friendly checkpoints: keep ONE full resumable 'last.ckpt' (overwritten
+  # in place, ignores save_weights_only) and save the periodic model-step=N /
+  # model-best checkpoints as small fp16 inference-only files (~4x smaller,
+  # EMA merged in, not resumable)
+  slim_checkpoints: false
   num_workers: 8
   eval_sample_steps: 32
   drop_spk_prob: 0.2
   time_schedule: "lognorm"
+  # Vocoder used to render validation audio/metrics: nsf-hifigan or pc-nsf-hifigan
+  vocoder: "nsf-hifigan"
   # Logger options
   logger: "wandb"  # Options: "wandb" or "tensorboard"

@@ -29,6 +29,12 @@ training:
   compile_model: false
   # Clip gradients for stability on small finetune datasets
   max_grad_norm: 1.0
+  # Recompute transformer activations in backward: large VRAM cut at ~20-30%
+  # slower steps. Enable only if hitting OOM (prefer it over reducing batch size)
+  gradient_checkpointing: false
+  # Keep the pre-EMA-swap weight backup on CPU during validation: one less full
+  # copy of the weights in VRAM at validation time, slightly slower swap
+  ema_offload_backup: false
   max_steps: 10000
   warmup_ratio: 0.05
   save_per_steps: 1000
@@ -37,6 +43,11 @@ training:
   wandb_project: "RIFT-SVC-FT"
   run_name: "finetune_dit-512-8_steps${training.max_steps}-lr${training.learning_rate}" 
   save_weights_only: true
+  # Disk-friendly checkpoints: keep ONE full resumable 'last.ckpt' (overwritten
+  # in place, ignores save_weights_only) and save the periodic model-step=N /
+  # model-best checkpoints as small fp16 inference-only files (~4x smaller,
+  # EMA merged in, not resumable)
+  slim_checkpoints: false
   num_workers: 8
   eval_sample_steps: 32
   # Single-speaker recipe (default): freeze the adaLN/time-embedding pathway and
@@ -49,6 +60,16 @@ training:
   # Exponential moving average of the weights; checkpoints store it under
   # 'ema_state_dict' and inference prefers it automatically. Set 0 to disable.
   ema_decay: 0.999
+  # Gaussian noise added to the content vectors during training. Fights source
+  # timbre leaking through the cvec, improving target timbre similarity. The
+  # cvec std is ~0.3, so try 0.01-0.05 (start at 0.02). 0 disables.
+  cvec_noise_std: 0.0
+  # Start new speaker embedding(s) from the pretrain's "average voice" (mean
+  # speaker / null-speaker embedding) instead of random init: faster and better
+  # timbre convergence, especially on short finetunes
+  init_spk_embed_from_pretrain: true
   time_schedule: "lognorm"
+  # Vocoder used to render validation audio/metrics: nsf-hifigan or pc-nsf-hifigan
+  vocoder: "nsf-hifigan"
   # Logger options
   logger: "wandb"  # Options: "wandb" or "tensorboard"

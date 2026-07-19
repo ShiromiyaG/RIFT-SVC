@@ -6,7 +6,8 @@ import torch
 import torch.nn.functional as F
 import torch.nn as nn
 from torch.nn import Conv1d, ConvTranspose1d, AvgPool1d, Conv2d
-from torch.nn.utils import weight_norm, remove_weight_norm, spectral_norm
+from torch.nn.utils.parametrizations import weight_norm, spectral_norm
+from torch.nn.utils.parametrize import remove_parametrizations
 from .utils import init_weights, get_padding
 
 LRELU_SLOPE = 0.1
@@ -18,7 +19,14 @@ def load_model(model_path, device='cuda'):
     generator = Generator(h).to(device)
 
     cp_dict = torch.load(model_path, map_location=device, weights_only=True)
-    generator.load_state_dict(cp_dict['generator'])
+    # Checkpoints were saved with the legacy weight_norm naming (weight_g/weight_v);
+    # remap to the parametrize API layout (original0 = g, original1 = v)
+    state_dict = {
+        k.replace('.weight_g', '.parametrizations.weight.original0')
+         .replace('.weight_v', '.parametrizations.weight.original1'): v
+        for k, v in cp_dict['generator'].items()
+    }
+    generator.load_state_dict(state_dict)
     generator.eval()
     generator.remove_weight_norm()
     del cp_dict
@@ -69,9 +77,9 @@ class ResBlock1(torch.nn.Module):
 
     def remove_weight_norm(self):
         for l in self.convs1:
-            remove_weight_norm(l)
+            remove_parametrizations(l, 'weight')
         for l in self.convs2:
-            remove_weight_norm(l)
+            remove_parametrizations(l, 'weight')
 
 
 class ResBlock2(torch.nn.Module):
@@ -95,7 +103,7 @@ class ResBlock2(torch.nn.Module):
 
     def remove_weight_norm(self):
         for l in self.convs:
-            remove_weight_norm(l)
+            remove_parametrizations(l, 'weight')
 
 
 class SineGen(torch.nn.Module):
@@ -210,11 +218,21 @@ class Generator(torch.nn.Module):
         self.h = h
         self.num_kernels = len(h.resblock_kernel_sizes)
         self.num_upsamples = len(h.upsample_rates)
-        self.m_source = SourceModuleHnNSF(
-            sampling_rate=h.sampling_rate,
-            harmonic_num=8
-        )
-        self.noise_convs = nn.ModuleList()
+        # PC-NSF-HiFiGAN ("mini_nsf": true in config.json) replaces the HN-NSF
+        # source module with a lightweight sine source generated at an
+        # intermediate sample rate and injected once after the second upsample.
+        self.mini_nsf = h.get('mini_nsf', False)
+        self.noise_sigma = h.get('noise_sigma', None)
+        if self.mini_nsf:
+            self.source_sr = h.sampling_rate / int(np.prod(h.upsample_rates[2:]))
+            self.upp = int(np.prod(h.upsample_rates[:2]))
+        else:
+            self.upp = int(np.prod(h.upsample_rates))
+            self.m_source = SourceModuleHnNSF(
+                sampling_rate=h.sampling_rate,
+                harmonic_num=8
+            )
+            self.noise_convs = nn.ModuleList()
         self.conv_pre = weight_norm(Conv1d(h.num_mels, h.upsample_initial_channel, 7, 1, padding=3))
         resblock = ResBlock1 if h.resblock == '1' else ResBlock2
 
@@ -224,12 +242,16 @@ class Generator(torch.nn.Module):
             self.ups.append(weight_norm(
                 ConvTranspose1d(h.upsample_initial_channel // (2 ** i), h.upsample_initial_channel // (2 ** (i + 1)),
                                 k, u, padding=(k - u) // 2)))
-            if i + 1 < len(h.upsample_rates):  #
-                stride_f0 = int(np.prod(h.upsample_rates[i + 1:]))
-                self.noise_convs.append(Conv1d(
-                    1, c_cur, kernel_size=stride_f0 * 2, stride=stride_f0, padding=stride_f0 // 2))
-            else:
-                self.noise_convs.append(Conv1d(1, c_cur, kernel_size=1))
+            if not self.mini_nsf:
+                if i + 1 < len(h.upsample_rates):  #
+                    stride_f0 = int(np.prod(h.upsample_rates[i + 1:]))
+                    self.noise_convs.append(Conv1d(
+                        1, c_cur, kernel_size=stride_f0 * 2, stride=stride_f0, padding=stride_f0 // 2))
+                else:
+                    self.noise_convs.append(Conv1d(1, c_cur, kernel_size=1))
+            elif i == 1:
+                self.source_conv = Conv1d(1, c_cur, 1)
+                self.source_conv.apply(init_weights)
         self.resblocks = nn.ModuleList()
         ch = h.upsample_initial_channel
         for i in range(len(self.ups)):
@@ -240,16 +262,38 @@ class Generator(torch.nn.Module):
         self.conv_post = weight_norm(Conv1d(ch, 1, 7, 1, padding=3))
         self.ups.apply(init_weights)
         self.conv_post.apply(init_weights)
-        self.upp = int(np.prod(h.upsample_rates))
+
+    def fastsinegen(self, f0):
+        # Sine source with per-frame linearly interpolated frequency (quadratic
+        # phase), which makes the output pitch follow the input f0 exactly.
+        n = torch.arange(1, self.upp + 1, device=f0.device)
+        s0 = f0.unsqueeze(-1) / self.source_sr
+        ds0 = F.pad(s0[:, 1:, :] - s0[:, :-1, :], (0, 0, 0, 1))
+        rad = s0 * n + 0.5 * ds0 * n * (n - 1) / self.upp
+        rad2 = torch.fmod(rad[..., -1:].float() + 0.5, 1.0) - 0.5
+        rad_acc = rad2.cumsum(dim=1).fmod(1.0).to(f0)
+        rad += F.pad(rad_acc[:, :-1, :], (0, 0, 1, 0))
+        rad = rad.reshape(f0.shape[0], 1, -1)
+        sines = torch.sin(2 * np.pi * rad)
+        return sines
 
     def forward(self, x, f0):
-        har_source = self.m_source(f0, self.upp).transpose(1, 2)
+        if self.mini_nsf:
+            har_source = self.fastsinegen(f0)
+        else:
+            har_source = self.m_source(f0, self.upp).transpose(1, 2)
         x = self.conv_pre(x)
+        if self.noise_sigma is not None and self.noise_sigma > 0:
+            x += self.noise_sigma * torch.randn_like(x)
         for i in range(self.num_upsamples):
             x = F.leaky_relu(x, LRELU_SLOPE)
             x = self.ups[i](x)
-            x_source = self.noise_convs[i](har_source)
-            x = x + x_source
+            if not self.mini_nsf:
+                x_source = self.noise_convs[i](har_source)
+                x = x + x_source
+            elif i == 1:
+                x_source = self.source_conv(har_source)
+                x = x + x_source
             xs = None
             for j in range(self.num_kernels):
                 if xs is None:
@@ -266,11 +310,11 @@ class Generator(torch.nn.Module):
     def remove_weight_norm(self):
         print('Removing weight norm...')
         for l in self.ups:
-            remove_weight_norm(l)
+            remove_parametrizations(l, 'weight')
         for l in self.resblocks:
             l.remove_weight_norm()
-        remove_weight_norm(self.conv_pre)
-        remove_weight_norm(self.conv_post)
+        remove_parametrizations(self.conv_pre, 'weight')
+        remove_parametrizations(self.conv_post, 'weight')
 
 
 class DiscriminatorP(torch.nn.Module):

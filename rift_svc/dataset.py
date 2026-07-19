@@ -5,7 +5,7 @@ from functools import partial
 from typing import Literal
 import torch
 from torch.nn.utils.rnn import pad_sequence
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 
 from rift_svc.utils import linear_interpolate_tensor, nearest_interpolate_tensor
 
@@ -37,7 +37,13 @@ class SVCDataset(Dataset):
         self.cvec_downsample_rate = cvec_downsample_rate
 
     def get_frame_len(self, index):
-        return self.samples[index]['frame_len']
+        sample = self.samples[index]
+        if 'frame_len' not in sample:
+            # meta_info.json doesn't store lengths; read it from the (mmapped)
+            # rms tensor header and cache it on the sample
+            path = os.path.join(self.data_dir, sample['speaker'], sample['file_name'])
+            sample['frame_len'] = pt_load(path + ".rms.pt").squeeze(0).shape[-1]
+        return sample['frame_len']
     
     def __len__(self):
         return len(self.samples)
@@ -100,6 +106,40 @@ class SVCDataset(Dataset):
             result['cvec_ds'] = cvec_ds
 
         return result
+
+
+class LengthBucketedRandomBatchSampler(Sampler):
+    """Random-with-replacement batch sampler that groups similarly-sized samples.
+
+    Draws a pool of random indices, sorts the pool by (cropped) frame length and
+    slices it into batches, then yields those batches in random order. This keeps
+    per-batch padding minimal (less wasted compute/VRAM in collate_fn) while batch
+    composition stays stochastic. Sized in batches for the whole run, so training
+    remains a single "epoch" like the previous RandomSampler(replacement=True).
+    """
+
+    def __init__(self, dataset: SVCDataset, batch_size: int, num_batches: int, pool_batches: int = 64):
+        self.lengths = torch.tensor([
+            min(dataset.get_frame_len(i), dataset.max_frame_len)
+            for i in range(len(dataset))
+        ])
+        self.batch_size = batch_size
+        self.num_batches = num_batches
+        self.pool_batches = pool_batches
+
+    def __len__(self):
+        return self.num_batches
+
+    def __iter__(self):
+        remaining = self.num_batches
+        while remaining > 0:
+            n = min(self.pool_batches, remaining)
+            idx = torch.randint(len(self.lengths), (n * self.batch_size,))
+            idx = idx[torch.argsort(self.lengths[idx])]
+            batches = idx.view(n, self.batch_size)
+            for b in torch.randperm(n).tolist():
+                yield batches[b].tolist()
+            remaining -= n
 
 
 def collate_fn(batch):

@@ -10,6 +10,28 @@ from torchaudio.transforms import Resample
 from jaxtyping import Float
 
 
+# Known vocoders and their default checkpoint locations. Both use the same
+# mel parametrization (44.1kHz, hop 512, 128 bins, fmin 40, fmax 16000), so
+# they are interchangeable at inference without retraining the acoustic model.
+VOCODER_CHECKPOINTS = {
+    'nsf-hifigan': 'pretrained/nsf_hifigan_44.1k_hop512_128bin_2024.02/model.ckpt',
+    'pc-nsf-hifigan': 'pretrained/pc_nsf_hifigan_44.1k_hop512_128bin_2025.02/model.ckpt',
+}
+
+
+def get_vocoder_checkpoint_path(vocoder_type: str) -> str:
+    if vocoder_type not in VOCODER_CHECKPOINTS:
+        raise ValueError(
+            f"Unknown vocoder type: {vocoder_type}. "
+            f"Available: {list(VOCODER_CHECKPOINTS.keys())}")
+    path = VOCODER_CHECKPOINTS[vocoder_type]
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"Vocoder checkpoint not found: {path}. "
+            f"Run `python pretrained/download.py` to download it.")
+    return path
+
+
 class DotDict(dict):
     def __getattr__(*args):         
         val = dict.get(*args)         
@@ -39,7 +61,9 @@ class Vocoder:
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.device = device
         
-        if vocoder_type == 'nsf-hifigan':
+        if vocoder_type in ('nsf-hifigan', 'pc-nsf-hifigan'):
+            # Both share the loading code; the Generator variant is selected by
+            # the `mini_nsf` flag in the checkpoint's config.json
             self.vocoder = NsfHifiGAN(vocoder_ckpt, device = device)
         elif vocoder_type == 'nsf-hifigan-log10':
             self.vocoder = NsfHifiGANLog10(vocoder_ckpt, device = device)

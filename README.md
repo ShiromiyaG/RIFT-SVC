@@ -34,6 +34,8 @@ source .venv/bin/activate
 python pretrained/download.py   
 ```
 
+This also downloads the optional [PC-NSF-HiFiGAN](https://github.com/openvpi/vocoders/releases/tag/pc-nsf-hifigan-44.1k-hop512-128bin-2025.02) vocoder (CC BY-NC-SA 4.0). Both vocoders share the same mel parametrization, so they are interchangeable at inference time without retraining: select with `--vocoder nsf-hifigan|pc-nsf-hifigan` in `infer.py` or the Vocoder dropdown in the GUI. PC-NSF-HiFiGAN follows key-shifted/out-of-range f0 better and has a wider pitch range.
+
 #### 4. Download pretrained weights for fine-tuning.
 
 | Model | Command |

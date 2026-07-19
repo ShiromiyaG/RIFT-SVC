@@ -12,7 +12,7 @@ from pytorch_lightning import LightningModule
 
 from rift_svc.metrics import mcd, psnr, si_snr
 from rift_svc.feature_extractors import get_mel_spectrogram
-from rift_svc.nsf_hifigan import NsfHifiGAN
+from rift_svc.nsf_hifigan import NsfHifiGAN, get_vocoder_checkpoint_path
 from rift_svc.utils import draw_mel_specs, l2_grad_norm
 
 
@@ -36,9 +36,20 @@ class RIFTSVCLightningModule(LightningModule):
         )
         self.log_media_per_steps = cfg['training']['log_media_per_steps']
         self.drop_spk_prob = cfg['training']['drop_spk_prob']
+        self.cvec_noise_std = cfg['training'].get('cvec_noise_std', 0.0)
         self.ema_decay = cfg['training'].get('ema_decay', 0.0)
+        # Keep the pre-swap weight backup on CPU during validation (one less
+        # full copy of the weights in VRAM, slightly slower swap)
+        self.ema_offload_backup = cfg['training'].get('ema_offload_backup', False)
         self.ema_shadow = None
         self._ema_backup = None
+        # Aligned tensor lists for batched (foreach) EMA updates
+        self._ema_shadow_list = None
+        self._ema_param_list = None
+
+        # Vocoded ground-truth mels are identical across validations; cache them
+        # (on CPU) after the first pass
+        self._val_gt_mel_cache = {}
 
         self.vocoder = None
         self.save_hyperparameters(ignore=['model', 'optimizer', 'vocoder'])
@@ -70,6 +81,13 @@ class RIFTSVCLightningModule(LightningModule):
             else:
                 # Restored from checkpoint: move to the current device
                 self.ema_shadow = {k: v.to(self.device) for k, v in self.ema_shadow.items()}
+            # Cache aligned lists once so the per-step update can use foreach ops
+            self._ema_shadow_list = []
+            self._ema_param_list = []
+            for name, p in self.model.named_parameters():
+                if name in self.ema_shadow:
+                    self._ema_shadow_list.append(self.ema_shadow[name])
+                    self._ema_param_list.append(p)
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
         if not self.ema_enabled or self.ema_shadow is None:
@@ -78,16 +96,16 @@ class RIFTSVCLightningModule(LightningModule):
         step = self.global_step
         decay = min(self.ema_decay, (1 + step) / (10 + step))
         with torch.no_grad():
-            for name, p in self.model.named_parameters():
-                if name in self.ema_shadow:
-                    self.ema_shadow[name].mul_(decay).add_(p.detach(), alpha=1 - decay)
+            # Batched in-place update; same math as a per-parameter loop
+            torch._foreach_mul_(self._ema_shadow_list, decay)
+            torch._foreach_add_(self._ema_shadow_list, self._ema_param_list, alpha=1 - decay)
 
     def _ema_swap_in(self):
         """Temporarily load EMA weights into the model (for validation/test)."""
         if not self.ema_enabled or self.ema_shadow is None or self._ema_backup is not None:
             return
         self._ema_backup = {
-            name: p.detach().clone()
+            name: p.detach().to('cpu', copy=True) if self.ema_offload_backup else p.detach().clone()
             for name, p in self.model.named_parameters() if name in self.ema_shadow
         }
         with torch.no_grad():
@@ -121,6 +139,11 @@ class RIFTSVCLightningModule(LightningModule):
         cvec = batch['cvec']
         frame_len = batch['frame_len']
 
+        if self.cvec_noise_std > 0:
+            # Perturb the content vectors so the model can't rely on the source
+            # timbre leaked through them (pulls timbre from the speaker embedding)
+            cvec = cvec + torch.randn_like(cvec) * self.cvec_noise_std
+
         drop_speaker = False
         if self.drop_spk_prob > 0:
             batch_size = spk_id.shape[0]
@@ -153,8 +176,9 @@ class RIFTSVCLightningModule(LightningModule):
             return
 
         if self.vocoder is None:
-            self.vocoder =  NsfHifiGAN(
-                'pretrained/nsf_hifigan_44.1k_hop512_128bin_2024.02/model.ckpt').to(self.device)
+            vocoder_type = self.cfg['training'].get('vocoder', 'nsf-hifigan')
+            self.vocoder = NsfHifiGAN(
+                get_vocoder_checkpoint_path(vocoder_type)).to(self.device)
         else:
             self.vocoder = self.vocoder.to(self.device)
         
@@ -239,18 +263,27 @@ class RIFTSVCLightningModule(LightningModule):
             
             # Generate audio using vocoder
             wav_gen = self.vocoder(mel_gen[i:i+1, :frame_len[i], :].transpose(1, 2), f0[i:i+1, :frame_len[i]])
-            wav_gt = self.vocoder(mel_gt[i:i+1, :frame_len[i], :].transpose(1, 2), f0[i:i+1, :frame_len[i]])
             wav_gen = wav_gen.squeeze(0)
-            wav_gt = wav_gt.squeeze(0)
 
             # Generate mel spectrograms
             mel_gen_i = get_mel_spectrogram(wav_gen).transpose(1, 2)
-            mel_gt_i = get_mel_spectrogram(wav_gt).transpose(1, 2)
 
             # Clip values to valid range
             mel_min, mel_max = self.model.mel_min, self.model.mel_max
             mel_gen_i = torch.clip(mel_gen_i, min=mel_min, max=mel_max)
-            mel_gt_i = torch.clip(mel_gt_i, min=mel_min, max=mel_max)
+
+            # The vocoded ground truth never changes across validations: vocode it
+            # only the first time each sample is seen and reuse the cached mel
+            cached_gt = self._val_gt_mel_cache.get(sample_idx)
+            if cached_gt is not None:
+                wav_gt = None
+                mel_gt_i = cached_gt.to(mel_gen_i.device)
+            else:
+                wav_gt = self.vocoder(mel_gt[i:i+1, :frame_len[i], :].transpose(1, 2), f0[i:i+1, :frame_len[i]])
+                wav_gt = wav_gt.squeeze(0)
+                mel_gt_i = get_mel_spectrogram(wav_gt).transpose(1, 2)
+                mel_gt_i = torch.clip(mel_gt_i, min=mel_min, max=mel_max)
+                self._val_gt_mel_cache[sample_idx] = mel_gt_i.detach().cpu()
 
             # Calculate metrics
             self.mcd.append(mcd(mel_gen_i, mel_gt_i).cpu().item())
@@ -269,7 +302,7 @@ class RIFTSVCLightningModule(LightningModule):
                     self._log_audio(self.logger, f"val-audio/spk-{spk_id[i].item()}_{sample_idx}-gen", audio_path, global_step)
                 
                 # Log ground truth audio only at the first step
-                if global_step == 0:
+                if global_step == 0 and wav_gt is not None:
                     gt_audio_path = f".cache/spk-{spk_id[i].item()}_{sample_idx}_gt.wav"
                     sf.write(gt_audio_path, wav_gt.cpu().to(torch.float32).T.numpy(), 44100)
                     self._log_audio(self.logger, f"val-audio/spk-{spk_id[i].item()}_{sample_idx}-gt", gt_audio_path, global_step)
@@ -285,6 +318,9 @@ class RIFTSVCLightningModule(LightningModule):
                     self._log_image(self.logger, f"val-mel/{sample_idx}_mel", cache_path, global_step)
     
     def on_test_start(self):
+        # The test dataloader may differ from the validation one; don't reuse
+        # cached ground-truth mels across stages
+        self._val_gt_mel_cache.clear()
         self.on_validation_start()
     
     def on_test_end(self):

@@ -6,6 +6,7 @@ from jaxtyping import Bool, Float, Int
 import torch
 from torch import nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 from x_transformers.x_transformers import RotaryEmbedding
 
 from rift_svc.modules import (
@@ -87,6 +88,9 @@ class DiT(nn.Module):
 
         self.dim = dim
         self.depth = depth
+        # Recompute block activations in backward instead of storing them
+        # (large VRAM cut at ~20-30% speed cost). Set from the training config.
+        self.gradient_checkpointing = False
         self.transformer_blocks = nn.ModuleList(
             [
                 DiTBlock(
@@ -173,10 +177,14 @@ class DiT(nn.Module):
             if isinstance(skip_layers, int):
                 skip_layers = [skip_layers]
 
+        use_ckpt = self.gradient_checkpointing and self.training and torch.is_grad_enabled()
         for i, block in enumerate(self.transformer_blocks):
             if skip_layers is not None and i in skip_layers:
                 continue
-            x = block(x, t, mask = mask, rope = rope)
+            if use_ckpt:
+                x = torch.utils.checkpoint.checkpoint(block, x, t, mask, rope, use_reentrant=False)
+            else:
+                x = block(x, t, mask = mask, rope = rope)
 
         x = self.norm_out(x, t)
         output = self.output(x)

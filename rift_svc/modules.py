@@ -164,11 +164,10 @@ class Attention(nn.Module):
         query = self.norm_q(query)
         key = self.norm_k(key)
 
-        # mask
+        # mask: keep it broadcastable ([b 1 1 n]) instead of expanding to
+        # [b h n n] — SDPA broadcasts it and avoids materializing the full mask
         if mask is not None:
-            attn_mask = mask
-            attn_mask = rearrange(attn_mask, 'b n -> b 1 1 n')
-            attn_mask = attn_mask.expand(batch_size, self.num_heads, query.shape[-2], key.shape[-2])
+            attn_mask = rearrange(mask, 'b n -> b 1 1 n')
         else:
             attn_mask = None
 

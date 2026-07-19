@@ -11,7 +11,7 @@ from torch.amp import autocast
 
 from rift_svc import DiT, RF
 from rift_svc.feature_extractors import HubertModelWithFinalProj, RMSExtractor, get_mel_spectrogram
-from rift_svc.nsf_hifigan import NsfHifiGAN
+from rift_svc.nsf_hifigan import NsfHifiGAN, get_vocoder_checkpoint_path
 from rift_svc.rmvpe import RMVPE
 from rift_svc.utils import linear_interpolate_tensor, post_process_f0, f0_ensemble, f0_ensemble_light, get_f0_pw, get_f0_pm
 from slicer import Slicer
@@ -38,10 +38,10 @@ def extract_state_dict(ckpt):
     return new_state_dict, spk2idx, model_cfg, dataset_cfg
 
 
-def load_models(model_path, device, use_fp16=True):
+def load_models(model_path, device, use_fp16=True, vocoder_type='nsf-hifigan'):
     """Load all required models and return them"""
     click.echo("Loading models...")
-    
+
     ckpt = torch.load(model_path, map_location='cpu')
     state_dict, spk2idx, dit_cfg, dataset_cfg = extract_state_dict(ckpt)
 
@@ -53,8 +53,8 @@ def load_models(model_path, device, use_fp16=True):
     # Keep the flow model weights in fp32: the ODE integration accumulates numerical
     # error across steps, so only the matmuls run in fp16 (via autocast).
     svc_model.eval()
-    
-    vocoder = NsfHifiGAN('pretrained/nsf_hifigan_44.1k_hop512_128bin_2024.02/model.ckpt').to(device)
+
+    vocoder = NsfHifiGAN(get_vocoder_checkpoint_path(vocoder_type)).to(device)
     rmvpe = RMVPE(model_path="pretrained/rmvpe/model.pt", hop_length=160, device=device)
     hubert = HubertModelWithFinalProj.from_pretrained("pretrained/content-vec-best").to(device)
     rms_extractor = RMSExtractor().to(device)
@@ -94,7 +94,7 @@ def apply_fade(audio, fade_samples, fade_in=True):
 
 
 def extract_features(audio_segment, sample_rate, hop_length, rmvpe, hubert, rms_extractor, 
-                     device, key_shift=0, ds_cfg_strength=0.0, cvec_downsample_rate=2, target_loudness=-18.0,
+                     device, key_shift=0, ds_cfg_strength=0.0, cvec_downsample_rate=1, target_loudness=-18.0,
                      robust_f0=0, use_fp16=True):
     """Extract all required features from an audio segment"""
     meter = pyln.Meter(sample_rate, block_size=0.1)
@@ -237,7 +237,7 @@ def process_segment(
     skip_cfg_strength=0.0, 
     cfg_skip_layers=None, 
     cfg_rescale=0.7,
-    cvec_downsample_rate=2,
+    cvec_downsample_rate=1,
     target_loudness=-18.0,
     restore_loudness=True,
     robust_f0=0,
@@ -299,7 +299,7 @@ def batch_process_segments(
     skip_cfg_strength=0.0, 
     cfg_skip_layers=None, 
     cfg_rescale=0.7,
-    cvec_downsample_rate=2,
+    cvec_downsample_rate=1,
     target_loudness=-18.0,
     restore_loudness=True,
     robust_f0=0,
@@ -485,6 +485,8 @@ def pad_tensor_to_length(tensor, length):
 @click.option('--input', type=click.Path(exists=True), required=True, help='Input audio file')
 @click.option('--output', type=click.Path(), required=True, help='Output audio file')
 @click.option('--speaker', type=str, required=True, help='Target speaker')
+@click.option('--vocoder', 'vocoder_type', type=click.Choice(['nsf-hifigan', 'pc-nsf-hifigan']), default='nsf-hifigan',
+              help='Vocoder to use (pc-nsf-hifigan handles key-shifted/out-of-range f0 better)')
 @click.option('--key-shift', type=int, default=0, help='Pitch shift in semitones')
 @click.option('--device', type=str, default=None, help='Device to use (cuda/cpu)')
 @click.option('--infer-steps', type=int, default=32, help='Number of inference steps')
@@ -493,7 +495,7 @@ def pad_tensor_to_length(tensor, length):
 @click.option('--skip-cfg-strength', type=float, default=0.0, help='Skip layer guidance strength')
 @click.option('--cfg-skip-layers', type=int, default=None, help='Layer to skip for classifier-free guidance')
 @click.option('--cfg-rescale', type=float, default=0.7, help='Classifier-free guidance rescale factor')
-@click.option('--cvec-downsample-rate', type=int, default=2, help='Downsampling rate for bad_cvec creation')
+@click.option('--cvec-downsample-rate', type=int, default=1, help='Downsampling rate for bad_cvec creation')
 @click.option('--target-loudness', type=float, default=-18.0, help='Target loudness in LUFS for normalization')
 @click.option('--restore-loudness', default=True, help='Restore loudness to original')
 @click.option('--fade-duration', type=float, default=20.0, help='Fade duration in milliseconds')
@@ -506,13 +508,14 @@ def pad_tensor_to_length(tensor, length):
 @click.option('--use-fp16/--no-fp16', default=True, help='Use float16 autocast for faster inference')
 @click.option('--batch-size', type=int, default=1, help='Batch size for parallel inference')
 @click.option('--ode-method', type=click.Choice(['euler', 'midpoint', 'rk4']), default='euler', help='ODE solver (midpoint gives better quality per step than euler)')
-@click.option('--sway-coef', type=float, default=0.0, help='Sway sampling coefficient (e.g. -0.5 concentrates steps at low t; 0 disables)')
+@click.option('--sway-coef', type=float, default=-0.5, help='Sway sampling coefficient (negative concentrates steps at low t; 0 disables)')
 @click.option('--seed', type=int, default=42, help='Random seed for the initial noise (consistent timbre across segments/runs)')
 def main(
     model,
     input,
     output,
     speaker,
+    vocoder_type,
     key_shift,
     device,
     infer_steps,
@@ -546,7 +549,7 @@ def main(
     generator = torch.Generator(device=device)
     generator.manual_seed(seed)
 
-    svc_model, vocoder, rmvpe, hubert, rms_extractor, spk2idx, dataset_cfg = load_models(model, device, use_fp16)
+    svc_model, vocoder, rmvpe, hubert, rms_extractor, spk2idx, dataset_cfg = load_models(model, device, use_fp16, vocoder_type)
 
     try:
         speaker_id = spk2idx[speaker]

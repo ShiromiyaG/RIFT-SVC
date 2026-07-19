@@ -12,6 +12,10 @@ NUM_WORKERS_PER_DEVICE="${2:-$DEFAULT_NUM_WORKERS}"
 echo "Using DATA_DIR: $DATA_DIR"
 echo "Using NUM_WORKERS_PER_DEVICE: $NUM_WORKERS_PER_DEVICE"
 
+# Optional: formant-preserving pitch-shift augmentation (WORLD). Copies are
+# train-only; run BEFORE prepare_data_meta.py so they get features extracted.
+# python scripts/prepare_pitch_aug.py --data-dir $DATA_DIR --shifts 2,-2
+
 python scripts/prepare_data_meta.py --data-dir $DATA_DIR
 python scripts/prepare_mel.py --data-dir $DATA_DIR
 python scripts/prepare_rms.py --data-dir $DATA_DIR

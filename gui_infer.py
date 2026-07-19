@@ -50,6 +50,8 @@ LANGUAGES = {
         "model_path_label": "Model Path",
         "model_path_placeholder": "Enter your model file path",
         "load_model_btn": "🔄 Load Model",
+        "vocoder_label": "Vocoder",
+        "vocoder_info": "pc-nsf-hifigan follows key-shifted/out-of-range pitch better. Applied on the next model load.",
         "input_audio_label": "Input Audio File",
         
         "basic_params": "⚙️ Basic Parameters",
@@ -147,6 +149,8 @@ LANGUAGES = {
         "model_path_label": "模型路径",
         "model_path_placeholder": "请输入您的模型文件路径",
         "load_model_btn": "🔄 加载模型",
+        "vocoder_label": "声码器",
+        "vocoder_info": "pc-nsf-hifigan 对移调/超出音域的音高更稳定。下次加载模型时生效。",
         "input_audio_label": "输入音频文件",
         
         "basic_params": "⚙️ 基本参数",
@@ -235,7 +239,7 @@ LANGUAGES = {
 
 current_language = "En"
 
-def initialize_models(model_path):
+def initialize_models(model_path, vocoder_type='nsf-hifigan'):
     global svc_model, vocoder, rmvpe, hubert, rms_extractor, spk2idx, dataset_cfg, current_language
 
     lang = LANGUAGES[current_language]
@@ -253,7 +257,7 @@ def initialize_models(model_path):
 
         # Load weights in fp32 so the fp16 checkbox (autocast only) can be toggled
         # freely at inference time without dtype mismatches
-        svc_model, vocoder, rmvpe, hubert, rms_extractor, spk2idx, dataset_cfg = load_models(model_path, device, use_fp16=False)
+        svc_model, vocoder, rmvpe, hubert, rms_extractor, spk2idx, dataset_cfg = load_models(model_path, device, use_fp16=False, vocoder_type=vocoder_type)
         available_speakers = list(spk2idx.keys())
         return available_speakers, f"{lang['model_loaded_success']} {', '.join(available_speakers)}"
     except Exception as e:
@@ -274,14 +278,14 @@ def process_with_progress(
     skip_cfg_strength=0.0,
     cfg_skip_layers=6,
     cfg_rescale=0.7,
-    cvec_downsample_rate=2,
+    cvec_downsample_rate=1,
     slicer_threshold=-30.0,
     slicer_min_length=3000,
     slicer_min_interval=100,
     slicer_hop_size=10,
     slicer_max_sil_kept=200,
     ode_method='euler',
-    sway_coef=0.0,
+    sway_coef=-0.5,
     seed=42
 ):
     global svc_model, vocoder, rmvpe, hubert, rms_extractor, spk2idx, dataset_cfg, current_language
@@ -525,7 +529,8 @@ def _slice_audio_file(f, out_dir, threshold, min_len_ms, max_len_s, overwrite):
 
 
 def run_preprocess(dataset_dir, data_dir, num_workers, overwrite, num_test_per_speaker,
-                   slice_enable=True, slice_threshold=-40.0, slice_min_len_ms=3000, slice_max_len_s=15.0):
+                   slice_enable=True, slice_threshold=-40.0, slice_min_len_ms=3000, slice_max_len_s=15.0,
+                   pitch_aug_enable=False, pitch_aug_shifts='2,-2'):
     """Copy audio from dataset_dir into data_dir and run the full feature pipeline."""
     lines = []
 
@@ -548,11 +553,12 @@ def run_preprocess(dataset_dir, data_dir, num_workers, overwrite, num_test_per_s
 
     # 1. Copy (and optionally slice) audio into the training data dir so the
     # originals in assets/dataset are never modified by normalization.
+    n_total = 7 if pitch_aug_enable else 6
     if slice_enable:
-        yield emit(f"[1/6] Slicing audio on silence (threshold {slice_threshold} dB, "
+        yield emit(f"[1/{n_total}] Slicing audio on silence (threshold {slice_threshold} dB, "
                    f"min {int(slice_min_len_ms)} ms, max {slice_max_len_s:g} s) into {data_dir} ...")
     else:
-        yield emit(f"[1/6] Copying audio from {dataset_dir} to {data_dir} ...")
+        yield emit(f"[1/{n_total}] Copying audio from {dataset_dir} to {data_dir} ...")
     n_copied, n_skipped = 0, 0
     for spk_dir in speakers:
         out_dir = dst_root / spk_dir.name
@@ -589,27 +595,36 @@ def run_preprocess(dataset_dir, data_dir, num_workers, overwrite, num_test_per_s
         return
 
     stages = [
-        ("[2/6] Resampling to 44100 Hz and normalizing to -18 LUFS",
+        ("Resampling to 44100 Hz and normalizing to -18 LUFS",
          [sys.executable, 'scripts/resample_normalize_audios.py', '--src', str(dst_root)]),
-        ("[3/6] Generating meta_info.json",
+    ]
+    if pitch_aug_enable:
+        stages.append(
+            ("Pitch-shift augmentation (formant-preserving, WORLD)",
+             [sys.executable, 'scripts/prepare_pitch_aug.py', '--data-dir', str(dst_root),
+              '--shifts', str(pitch_aug_shifts).strip() or '2,-2',
+              '--num-workers', str(int(num_workers))] + (['--overwrite'] if overwrite else [])))
+    stages += [
+        ("Generating meta_info.json",
          [sys.executable, 'scripts/prepare_data_meta.py', '--data-dir', str(dst_root),
           '--split-type', 'stratified', '--num-test-per-speaker', str(int(num_test_per_speaker))]),
-        ("[4/6] Extracting mel spectrograms",
+        ("Extracting mel spectrograms",
          [sys.executable, 'scripts/prepare_mel.py', '--data-dir', str(dst_root),
           '--num-workers', str(int(num_workers))] + (['--overwrite'] if overwrite else [])),
-        ("[4/6] Extracting RMS",
+        ("Extracting RMS",
          [sys.executable, 'scripts/prepare_rms.py', '--data-dir', str(dst_root),
           '--num-workers', str(int(num_workers))]),
-        ("[5/6] Extracting F0 (RMVPE)",
+        ("Extracting F0 (RMVPE)",
          [sys.executable, 'scripts/prepare_f0.py', '--data-dir', str(dst_root),
           '--num-workers', str(int(num_workers))] + (['--overwrite'] if overwrite else [])),
-        ("[6/6] Extracting content vectors (ContentVec)",
+        ("Extracting content vectors (ContentVec)",
          [sys.executable, 'scripts/prepare_cvec.py', '--data-dir', str(dst_root),
           '--num-workers', str(int(num_workers))] + (['--overwrite'] if overwrite else [])),
     ]
 
-    for title, cmd in stages:
-        yield emit(f"{title} ...")
+    n_stages = len(stages) + 1  # the copy/slice step above was step 1
+    for stage_idx, (title, cmd) in enumerate(stages, start=2):
+        yield emit(f"[{stage_idx}/{n_stages}] {title} ...")
         failed = False
         for chunk in _stream_command(cmd):
             if chunk is None:
@@ -688,7 +703,8 @@ def start_training(
     drop_spk_prob, ema_decay, max_grad_norm,
     freeze_adaln, num_workers,
     grad_accum=1, compile_model=False,
-    resume_ckpt='', save_full_ckpt=True,
+    resume_ckpt='', save_full_ckpt=True, slim_checkpoints=False,
+    cvec_noise_std=0.0,
 ):
     global train_process
     if train_process is not None and train_process.poll() is None:
@@ -718,10 +734,10 @@ def start_training(
             yield f"ERROR: could not read resume checkpoint: {e}"
             return
         if not resumable:
-            yield ("ERROR: this is a weights-only checkpoint and cannot be resumed "
-                   "(no optimizer state). Train with 'Save full checkpoints' enabled "
-                   "to produce resumable checkpoints — or use it as 'Pretrained Checkpoint' "
-                   "instead to start a new run from those weights.")
+            yield ("ERROR: this is a weights-only/slim checkpoint and cannot be resumed "
+                   "(no optimizer state). Resumable files come from 'Save full checkpoints' "
+                   "(model-step=N.ckpt) or 'Slim checkpoints' (last.ckpt only) — or use this "
+                   "file as 'Pretrained Checkpoint' instead to start a new run from those weights.")
             return
         resume_ckpt = rp.as_posix()
 
@@ -744,10 +760,12 @@ def start_training(
         f'training.drop_spk_prob={drop_spk_prob}',
         f'training.ema_decay={ema_decay}',
         f'training.max_grad_norm={max_grad_norm}',
+        f'training.cvec_noise_std={cvec_noise_std}',
         f'training.num_workers={int(num_workers)}',
         f'training.grad_accumulation_steps={max(1, int(grad_accum))}',
         f'training.compile_model={"true" if compile_model else "false"}',
         f'training.save_weights_only={"false" if save_full_ckpt else "true"}',
+        f'training.slim_checkpoints={"true" if slim_checkpoints else "false"}',
         'training.logger=tensorboard',
     ]
     if resume_ckpt:
@@ -912,6 +930,9 @@ def create_ui():
                         with gr.Group():
                             input_markdown = gr.Markdown(lang["input_section"])
                             model_path = gr.Textbox(label=lang["model_path_label"], value="", placeholder=lang["model_path_placeholder"], interactive=True)
+                            vocoder_type = gr.Dropdown(choices=['nsf-hifigan', 'pc-nsf-hifigan'], value='nsf-hifigan',
+                                                       label=lang["vocoder_label"], info=lang["vocoder_info"],
+                                                       elem_id="vocoder_type")
                             reload_btn = gr.Button(lang["load_model_btn"], elem_id="reload_btn")
                             input_audio = gr.Audio(label=lang["input_audio_label"], type="filepath", elem_id="input_audio")
 
@@ -931,7 +952,7 @@ def create_ui():
                                                     label=lang["ode_method"],
                                                     info=lang["ode_method_info"],
                                                     elem_id="ode_method")
-                            sway_coef = gr.Slider(minimum=-1.0, maximum=1.0, step=0.05, value=0.0,
+                            sway_coef = gr.Slider(minimum=-1.0, maximum=1.0, step=0.05, value=-0.5,
                                                  label=lang["sway_coef"],
                                                  info=lang["sway_coef_info"],
                                                  elem_id="sway_coef")
@@ -959,7 +980,7 @@ def create_ui():
                                                    label=lang["cfg_rescale"],
                                                    info=lang["cfg_rescale_info"],
                                                    elem_id="cfg_rescale")
-                            cvec_downsample_rate = gr.Radio(choices=[1, 2, 4, 8], value=2,
+                            cvec_downsample_rate = gr.Radio(choices=[1, 2, 4, 8], value=1,
                                                           label=lang["cvec_downsample"],
                                                           info=lang["cvec_downsample_info"],
                                                           elem_id="cvec_downsample_rate")
@@ -1021,6 +1042,13 @@ def create_ui():
                             num_test_per_speaker = gr.Slider(minimum=1, maximum=5, step=1, value=1,
                                                             label="Validation Files per Speaker")
                         preprocess_overwrite = gr.Checkbox(label="Overwrite existing files/features", value=False)
+                        with gr.Accordion("🎹 Pitch-Shift Augmentation", open=False):
+                            pitch_aug_enable = gr.Checkbox(label="Generate pitch-shifted copies (formant-preserving)", value=False,
+                                                          info="WORLD-based augmentation: teaches the target timbre across a wider "
+                                                               "pitch range (better key-shift results). Multiplies dataset size and "
+                                                               "preprocessing time; copies go to the train split only")
+                            pitch_aug_shifts = gr.Textbox(label="Shifts (semitones)", value="2,-2",
+                                                         info="Comma-separated list, e.g. 2,-2 or 2,-2,4,-4")
                         with gr.Accordion("✂️ Slicer", open=False):
                             slice_enable = gr.Checkbox(label="Slice long audios on silence", value=True,
                                                       info="Recommended: splits recordings into training-sized segments")
@@ -1070,6 +1098,11 @@ def create_ui():
                             with gr.Row():
                                 max_grad_norm = gr.Number(value=1.0, label="Max Grad Norm", info="0 disables clipping")
                                 train_num_workers = gr.Number(value=4, label="Dataloader Workers", precision=0)
+                            cvec_noise_std = gr.Slider(minimum=0.0, maximum=0.1, step=0.005, value=0.0,
+                                                      label="Content Vector Noise Std",
+                                                      info="Gaussian noise on the content vectors during training: fights source "
+                                                           "timbre leakage, improving target timbre similarity. Try 0.02 "
+                                                           "(cvec std is ~0.3). 0 disables")
                             with gr.Row():
                                 grad_accum = gr.Number(value=1, label="Grad Accumulation Steps", precision=0,
                                                       info="Effective batch = batch size × this. Use to simulate larger batches on limited VRAM")
@@ -1087,6 +1120,11 @@ def create_ui():
                             save_full_ckpt = gr.Checkbox(label="Save full checkpoints (resumable; larger files)", value=True,
                                                         info="Includes optimizer/EMA state so training can be resumed. "
                                                              "Uncheck to save weights-only checkpoints (smaller, not resumable)")
+                            slim_checkpoints = gr.Checkbox(label="Slim checkpoints (saves disk space)", value=False,
+                                                          info="Keeps ONE full resumable last.ckpt (overwritten in place) and saves "
+                                                               "the periodic/best checkpoints as small fp16 inference-only files "
+                                                               "(~4-6x smaller, EMA merged in). Resume only from last.ckpt. "
+                                                               "Overrides the 'Save full checkpoints' option above")
                         recipe_note = gr.Markdown("")
                         with gr.Row():
                             train_btn = gr.Button("🚀 Start Training", variant="primary")
@@ -1160,11 +1198,12 @@ def create_ui():
                 gr.update(label=lang["sway_coef"], info=lang["sway_coef_info"]),
                 gr.update(label=lang["seed"], info=lang["seed_info"]),
                 gr.update(label=lang["tab_inference"]),
-                gr.update(label=lang["tab_train"])
+                gr.update(label=lang["tab_train"]),
+                gr.update(label=lang["vocoder_label"], info=lang["vocoder_info"])
             ]
         
-        def load_model_and_update_speakers(model_path):
-            available_speakers, message = initialize_models(model_path)
+        def load_model_and_update_speakers(model_path, vocoder_type):
+            available_speakers, message = initialize_models(model_path, vocoder_type)
             
             if available_speakers and len(available_speakers) > 0:
                 return gr.update(choices=available_speakers, value=available_speakers[0]), message
@@ -1185,13 +1224,14 @@ def create_ui():
                 convert_btn, output_markdown, output_audio, output_message,
                 html_header, tips_html,
                 sampling_accordion, ode_method, sway_coef, seed,
-                inference_tab, train_tab
+                inference_tab, train_tab,
+                vocoder_type
             ]
         )
         
         reload_btn.click(
             fn=load_model_and_update_speakers,
-            inputs=[model_path],
+            inputs=[model_path, vocoder_type],
             outputs=[speaker, output_message]
         )
         
@@ -1227,7 +1267,8 @@ def create_ui():
         preprocess_btn.click(
             fn=run_preprocess,
             inputs=[dataset_dir, train_data_dir, preprocess_workers, preprocess_overwrite, num_test_per_speaker,
-                    slice_enable, slice_threshold, slice_min_len_ms, slice_max_len_s],
+                    slice_enable, slice_threshold, slice_min_len_ms, slice_max_len_s,
+                    pitch_aug_enable, pitch_aug_shifts],
             outputs=[preprocess_log]
         ).then(
             fn=suggest_speaker_settings,
@@ -1263,7 +1304,8 @@ def create_ui():
                 drop_spk_prob, ema_decay, max_grad_norm,
                 freeze_adaln, train_num_workers,
                 grad_accum, compile_model,
-                resume_ckpt, save_full_ckpt,
+                resume_ckpt, save_full_ckpt, slim_checkpoints,
+                cvec_noise_std,
             ],
             outputs=[train_log]
         )
